@@ -75,6 +75,23 @@ load.runtime.sendUserMessage = (message, options) => messages.push({ message, op
 await ext.handlers.get("session_start")?.[0]?.({ type: "session_start", reason: "startup" }, ctx);
 check("terminal input hook installed", typeof inputHandler === "function");
 
+// The standing rule must be appended to the system prompt, and only once.
+const beforeAgentStart = ext.handlers.get("before_agent_start")?.[0];
+const basePrompt = "BASE PROMPT";
+const injected = beforeAgentStart?.({ type: "before_agent_start", prompt: "hi", systemPrompt: basePrompt }, ctx);
+check(
+	"system prompt rule appended",
+	typeof injected?.systemPrompt === "string" &&
+		injected.systemPrompt.startsWith(basePrompt) &&
+		injected.systemPrompt.includes("Backgrounded shell commands"),
+	injected?.systemPrompt,
+);
+check(
+	"system prompt rule not appended twice",
+	beforeAgentStart({ type: "before_agent_start", prompt: "hi", systemPrompt: injected.systemPrompt }, ctx) ===
+		undefined,
+);
+
 const toolCtx = {
 	cwd: process.cwd(),
 	sessionManager: { getSessionId: () => "smoke", getSessionFile: () => undefined },
@@ -99,11 +116,13 @@ await sleep(500);
 check("Ctrl+B consumed while running", JSON.stringify(inputHandler("\x02")) === '{"consume":true}');
 const detached = await long;
 const released = Date.now() - started;
+const detachedText = JSON.stringify(detached);
 check(
 	"tool call released early",
-	released < 1500 && JSON.stringify(detached).includes("moved to background"),
-	`${released}ms ${JSON.stringify(detached)}`,
+	released < 1500 && detachedText.includes("moved to background"),
+	`${released}ms ${detachedText}`,
 );
+check("note tells the model to end its turn", detachedText.includes("end your turn"), detachedText);
 
 // 4. Completion report reaches the user and the agent.
 await sleep(2500);

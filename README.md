@@ -12,6 +12,7 @@ While the model is running a shell command:
 - The process keeps running — pressing **Escape** after backgrounding does *not* kill it.
 - When the process exits, pi shows a **toast** and sends the agent a **user message** with the command, cwd, exit code, duration and the tail of its output.
 - A footer status (`bg: #2`) tracks background jobs and clears as they finish.
+- The agent is told what a backgrounded command means: **do not re-run it, do not sleep or poll to wait for it, and end the turn if there is nothing else to do.**
 
 When no command is running, Ctrl+B is passed through untouched, so its default "cursor left" behaviour is preserved.
 
@@ -65,6 +66,18 @@ pi's extension API can register tools and raw terminal input listeners, which is
 - On completion the wrapper reports through `ctx.ui.notify` and `pi.sendUserMessage(..., { deliverAs: "steer" })`.
 
 Job state lives in a `globalThis` registry, so `/reload` (which re-imports the extension) does not orphan a command that was backgrounded before the reload.
+
+## The rule the agent is given
+
+Backgrounding only helps if the agent stops waiting on the command, so the rule is stated twice:
+
+1. In the tool result itself, the moment a command is backgrounded:
+   > `[pi] Command moved to background (job #27). It is still running; pi will message you with the exit code and output when it finishes. Do not re-run it, and do not sleep, Wait-Sleep or poll to wait for it. If you have nothing else to do, end your turn now.`
+2. As a `## Backgrounded shell commands` section appended to the system prompt on every turn via `before_agent_start`, so it also holds on turns where nothing was backgrounded.
+
+Both say: never re-run a backgrounded command, never wait for it (`sleep`, `Start-Sleep`, `Wait-Sleep`, `timeout`, poll loops), do other work if there is any, and otherwise end the turn — the result arrives on its own.
+
+The same text can be pinned in `~/.pi/agent/AGENTS.md` (pi's user-instructions context file) if you want the rule to hold even when the extension is not installed.
 
 ## Behaviour notes
 

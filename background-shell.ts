@@ -90,6 +90,30 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/* ------------------------------------------------------------ agent rules */
+
+const RULE_HEADING = "## Backgrounded shell commands";
+
+/** Tells the model, at the moment it matters, that waiting is pointless. */
+function backgroundedNote(jobId: number): string {
+	return (
+		`[pi] Command moved to background (job #${jobId}). It is still running; pi will message you ` +
+		`with the exit code and output when it finishes. Do not re-run it, and do not sleep, ` +
+		`Wait-Sleep or poll to wait for it. If you have nothing else to do, end your turn now.`
+	);
+}
+
+/** The same rule, so it also holds on turns where nothing was backgrounded. */
+const SYSTEM_RULE = `${RULE_HEADING}
+
+A shell tool result containing "Command moved to background" means the process is still running.
+Pi delivers its exit code and output as a message when it exits.
+
+- Never re-run a backgrounded command, and never wait for it: no \`sleep\`, \`Start-Sleep\`,
+  \`Wait-Sleep\`, \`timeout\`, or any poll/re-check loop.
+- If you have other work, do it. If you have nothing else to do, end your turn immediately -
+  the result arrives on its own.`;
+
 /* ------------------------------------------------------- operations wrapper */
 
 /**
@@ -159,13 +183,7 @@ function wrapOperations(tool: string, base: BashOperations): BashOperations {
 					detached = true;
 					state.running.delete(job.id);
 					state.background.set(job.id, job);
-					options.onData(
-						Buffer.from(
-							`\n\n[pi] Command moved to background (job #${job.id}). The process is still ` +
-								`running; pi will message you with the exit code and output when it finishes. ` +
-								`Do not run it again to check.`,
-						),
-					);
+					options.onData(Buffer.from(`\n\n${backgroundedNote(job.id)}`));
 					resolve({ exitCode: 0 });
 					return true;
 				};
@@ -266,6 +284,13 @@ export default function (pi: ExtensionAPI) {
 	);
 
 	state.messageApi = (message: string) => pi.sendUserMessage(message, { deliverAs: "steer" });
+
+	// Append the rule to the system prompt so it is present on every turn, not just
+	// the turn that backgrounds something.
+	pi.on("before_agent_start", (event) => {
+		if (event.systemPrompt.includes(RULE_HEADING)) return;
+		return { systemPrompt: `${event.systemPrompt}\n\n${SYSTEM_RULE}` };
+	});
 
 	pi.on("session_start", (_event, ctx) => {
 		state.uiCtx = ctx;
