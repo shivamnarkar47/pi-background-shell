@@ -162,7 +162,7 @@ const released = Date.now() - started;
 const detachedText = JSON.stringify(detached);
 check(
 	"tool call released early",
-	released < 1500 && detachedText.includes("moved to background"),
+	released < 1500 && detachedText.includes("moved to the background"),
 	`${released}ms ${detachedText}`,
 );
 check("note tells the model to end its turn", detachedText.includes("end your turn"), detachedText);
@@ -237,7 +237,64 @@ check(
 	notices.join(" | "),
 );
 
-// 7. Completion report reaches the user and the agent.
+// 7. Duplicate guard and shell_jobs, all while a job is still backgrounded.
+const VICTIM_BODY =
+	"Write-Output victim-start; $t = [Diagnostics.Stopwatch]::StartNew(); " +
+	"while ($t.Elapsed.TotalSeconds -lt 20) {}; Write-Output victim-done";
+const shellJobs = ext.tools.get("shell_jobs");
+check("shell_jobs tool registered", Boolean(shellJobs?.definition?.execute));
+const jobsCall = (id, params) =>
+	shellJobs.definition
+		.execute(id, params, new AbortController().signal, undefined, toolCtx)
+		.then((r) => r.content?.[0]?.text ?? "")
+		.catch((error) => `threw: ${error.message}`);
+
+const live = run("live", VICTIM_BODY);
+await sleep(700);
+check("Ctrl+B detaches the live job", JSON.stringify(inputHandler("\x02")) === '{"consume":true}');
+await live;
+
+const listed = await jobsCall("list", { action: "list" });
+const liveId = Math.max(
+	...listed
+		.split("\n")
+		.filter((line) => line.includes("victim-start"))
+		.map((line) => Number(/#(\d+)/.exec(line)[1])),
+);
+check("shell_jobs list shows it as background", listed.includes(`#${liveId}`) && listed.includes("background"), listed);
+
+const duplicate = await run(
+	"duplicate",
+	`cd ${process.cwd()} && timeout 300 ${VICTIM_BODY} > $null 2>&1; Select-String -Pattern victim-done`,
+);
+check(
+	"duplicate of a backgrounded command refused",
+	typeof duplicate?.error === "string" &&
+		duplicate.error.includes("already running this command") &&
+		duplicate.error.includes(`#${liveId}`),
+	JSON.stringify(duplicate),
+);
+const stillAllowed = await run("other-program", "Write-Output unrelated-work");
+check(
+	"a different command is still allowed",
+	JSON.stringify(stillAllowed).includes("unrelated-work"),
+	JSON.stringify(stillAllowed),
+);
+
+const partial = await jobsCall("output", { action: "output", id: liveId });
+check(
+	"shell_jobs output returns what the job printed so far",
+	partial.includes("victim-start") && partial.includes("still running"),
+	partial.slice(0, 200),
+);
+check(
+	"shell_jobs output for an unknown id is reported",
+	(await jobsCall("unknown", { action: "output", id: 4242 })).includes("No shell job #4242"),
+);
+const killedByTool = await jobsCall("kill", { action: "kill", id: liveId });
+check("shell_jobs kill stops a job", killedByTool.startsWith(`Killed #${liveId}`), killedByTool);
+
+// 8. Completion report reaches the user and the agent.
 await sleep(6500);
 check(
 	"toast shown on completion",

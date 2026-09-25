@@ -8,8 +8,13 @@
  *   - when it exits, pi shows a toast and sends the details (exit code, duration,
  *     output tail) to the agent as a user message.
  *
- * When no command is running the key is passed through, so the default
- * "cursor left" behaviour of Ctrl+B is preserved.
+ * Anything still running after AUTO_BACKGROUND_SECONDS is backgrounded automatically,
+ * so long commands never stall a turn even without the keypress. While a job is
+ * backgrounded the wrapper refuses wait commands and second copies of the same
+ * command; the model can inspect jobs with the shell_jobs tool.
+ *
+ * When no command is running Ctrl+B is passed through, so the default "cursor left"
+ * behaviour is preserved.
  *
  * /background            list running and backgrounded shell commands
  * /background kill <id>  kill one (or "all")
@@ -27,6 +32,7 @@ import {
 	getAgentDir,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { Box, Text } from "@earendil-works/pi-tui";
 
 type ExecResult = { exitCode: number | null };
@@ -35,6 +41,10 @@ type ExecOutcome = { ok: true; result: ExecResult } | { ok: false; error: unknow
 const STATUS_KEY = "background-jobs";
 const CAPTURE_LIMIT = 40_000; // characters of output kept in memory per job
 const REPORT_TAIL = 4_000; // characters of output included in the completion message
+const OUTPUT_VIEW = 8_000; // characters returned by the shell_jobs output action
+/** A command still running after this is moved to the background without Ctrl+B. */
+const AUTO_BACKGROUND_SECONDS = 20;
+const AUTO_BACKGROUND_MS = AUTO_BACKGROUND_SECONDS * 1000;
 
 interface Job {
 	id: number;
@@ -45,10 +55,14 @@ interface Job {
 	output: string;
 	/** Detaches the job from its tool call. Returns false if the call already finished. */
 	detach: (() => boolean) | undefined;
+	/** Reduced form of the command, used to recognise a duplicate re-run. */
+	core: string;
 	/** Owns the child process, so /background can kill a detached job. */
 	controller: AbortController | undefined;
 	/** Whether the user killed it from /background (changes how the report reads). */
 	killed: boolean;
+	/** Whether it was auto-backgrounded on the timer rather than by Ctrl+B. */
+	auto: boolean;
 }
 
 interface SharedState {
@@ -103,23 +117,54 @@ function errorMessage(error: unknown): string {
 const RULE_HEADING = "## Backgrounded shell commands";
 
 /** Tells the model, at the moment it matters, that waiting is pointless. */
-function backgroundedNote(jobId: number): string {
+function backgroundedNote(jobId: number, auto: boolean): string {
+	const why = auto
+		? `still running after ${AUTO_BACKGROUND_SECONDS}s, so it was moved to the background automatically`
+		: "moved to the background";
 	return (
-		`[pi] Command moved to background (job #${jobId}). It is still running; pi will message you ` +
-		`with the exit code and output when it finishes. Do not re-run it, and do not sleep, ` +
-		`Wait-Sleep or poll to wait for it. If you have nothing else to do, end your turn now.`
+		`[pi] Command ${why} (job #${jobId}). It keeps running; pi will message you with the exit ` +
+		`code and output when it finishes. Do not re-run it, and do not sleep, Wait-Sleep or poll to ` +
+		`wait for it - shell_jobs with action "output" reads its output so far. If you have nothing ` +
+		`else to do, end your turn now.`
 	);
+}
+
+/**
+ * The part of a command that decides what actually runs, so a second copy of an
+ * already-running command is recognisable: `cd X && timeout 300 foo.py > f 2>&1; sed …`
+ * and `foo.py` reduce to the same core.
+ */
+function commandCore(command: string): string {
+	return command
+		.replace(/\\\r?\n/g, " ")
+		.replace(/\b(?:g?timeout)\s+\d+[smhd]?\s+/gi, "")
+		.replace(/\bcd\s+(?:"[^"]+"|'[^']+'|\S+)\s*(?:&&|;)\s*/gi, "")
+		// reader commands first, while their separator is still intact
+		.replace(
+			/(?:\|+|;|&&)\s*(?:sed|head|tail|grep|egrep|awk|cut|sort|uniq|less|more|findstr|select-string|select-object)\b.*$/gi,
+			"",
+		)
+		// redirections: the target must not swallow ; & or |
+		.replace(/\s*\d?>&\d?/g, " ")
+		.replace(/\s*(?:\d?>>?\s*|\d?<&?\s*)["']?[^\s;|&]+["']?/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
 }
 
 /** The same rule, so it also holds on turns where nothing was backgrounded. */
 const SYSTEM_RULE = `${RULE_HEADING}
 
 A shell tool result containing "Command moved to background" means the process is still running.
-Pi delivers its exit code and output as a message when it exits.
+Pi delivers its exit code and output as a message when it exits. Any command still running after
+${AUTO_BACKGROUND_SECONDS} seconds is moved to the background automatically, so a long run
+returning early is normal, not a failure.
 
 - Never re-run a backgrounded command, and never wait for it: no \`sleep\`, \`Start-Sleep\`,
   \`Wait-Sleep\`, \`timeout\`, or any poll/re-check loop. Pi refuses such commands outright
-  while a backgrounded command is still running.
+  while a backgrounded command is still running, and refuses a second copy of a command
+  that is already running.
+- To see how a backgrounded command is doing, call \`shell_jobs\` with action "output" and its
+  id, or action "kill" to stop it. Do not start a fresh copy to find out.
 - If you have other work, do it. If you have nothing else to do, end your turn immediately -
   the result arrives on its own.`;
 
@@ -161,16 +206,31 @@ function wrapOperations(tool: string, base: BashOperations): BashOperations {
 						`your turn - pi will message you with the exit code and output when the job finishes.`,
 				);
 			}
+			if (state.background.size > 0) {
+				const core = commandCore(command);
+				const twin = [...state.background.values()].find((job) => job.core === core);
+				if (twin) {
+					notify(`Refused a duplicate of background #${twin.id}`);
+					throw new Error(
+						`[pi] refused: background job #${twin.id} is already running this command ` +
+							`(${core.slice(0, 120)}). Do not start a second copy. Read it with shell_jobs ` +
+							`(action "output", id ${twin.id}) or kill it with action "kill"; the full result ` +
+							`is delivered automatically when it finishes.`,
+					);
+				}
+			}
 			const job: Job = {
 				id: state.nextId++,
 				tool,
 				command,
+				core: commandCore(command),
 				cwd,
 				startedAt: Date.now(),
 				output: "",
 				detach: undefined,
 				controller: undefined,
 				killed: false,
+				auto: false,
 			};
 			state.running.set(job.id, job);
 			const decoder = new StringDecoder("utf8");
@@ -178,6 +238,7 @@ function wrapOperations(tool: string, base: BashOperations): BashOperations {
 			job.controller = controller;
 			let detached = false;
 			let finished = false;
+			let autoTimer: ReturnType<typeof setTimeout> | undefined;
 			const forwardAbort = () => {
 				if (!detached) controller.abort();
 			};
@@ -202,6 +263,7 @@ function wrapOperations(tool: string, base: BashOperations): BashOperations {
 					finished = true;
 					job.detach = undefined;
 					job.controller = undefined;
+					if (autoTimer) clearTimeout(autoTimer);
 					state.running.delete(job.id);
 					options.signal?.removeEventListener("abort", forwardAbort);
 					if (detached) {
@@ -217,15 +279,29 @@ function wrapOperations(tool: string, base: BashOperations): BashOperations {
 					(outcome) => (outcome.ok ? resolve(outcome.result) : reject(outcome.error)),
 					reject,
 				);
-				job.detach = () => {
+				/** Releases the tool call; the child keeps running either way. */
+				const detach = (auto: boolean): boolean => {
 					if (finished || detached) return false;
 					detached = true;
+					if (autoTimer) clearTimeout(autoTimer);
+					job.auto = auto;
 					state.running.delete(job.id);
 					state.background.set(job.id, job);
-					options.onData(Buffer.from(`\n\n${backgroundedNote(job.id)}`));
+					options.onData(Buffer.from(`\n\n${backgroundedNote(job.id, auto)}`));
 					resolve({ exitCode: 0 });
 					return true;
 				};
+				job.detach = () => detach(false);
+				// Long commands move to the background on their own, no keypress needed.
+				autoTimer = setTimeout(() => {
+					if (detach(true)) {
+						notify(
+							`${job.tool} #${job.id} still running after ${AUTO_BACKGROUND_SECONDS}s - moved to background`,
+						);
+						updateStatus();
+					}
+				}, AUTO_BACKGROUND_MS);
+				(autoTimer as { unref?: () => void }).unref?.();
 			});
 		},
 	};
@@ -254,10 +330,11 @@ function report(job: Job, outcome: ExecOutcome): void {
 		succeeded ? "info" : "warning",
 	);
 
+	const how = job.auto ? `, auto-backgrounded after ${AUTO_BACKGROUND_SECONDS}s` : "";
 	const message = [
 		`[background ${job.tool} command #${job.id}] ${
 			succeeded ? "finished successfully" : "failed"
-		} after ${seconds}s (${succeeded ? "exit code 0" : failure}).`,
+		} after ${seconds}s (${succeeded ? "exit code 0" : failure}${how}).`,
 		`command: ${job.command}`,
 		`cwd: ${job.cwd}`,
 		"",
@@ -347,6 +424,24 @@ function killJob(id: number): boolean {
 	return true;
 }
 
+function jobState(job: Job): "background" | "running" {
+	return state.background.has(job.id) ? "background" : "running";
+}
+
+function toolText(body: string) {
+	return { content: [{ type: "text" as const, text: body }] };
+}
+
+/** The model-facing view of one job, used by the shell_jobs tool. */
+function jobLine(job: Job): string {
+	const kind = jobState(job);
+	const label = kind === "background" && job.auto ? "background (auto)" : kind;
+	return `#${job.id} ${label.padEnd(18)} ${fmtElapsed(Date.now() - job.startedAt).padEnd(8)} ${clip(
+		job.command,
+		70,
+	)}`;
+}
+
 /* ------------------------------------------------------------- extension */
 
 export default function (pi: ExtensionAPI) {
@@ -399,6 +494,70 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		unsubscribeInput?.();
 		unsubscribeInput = undefined;
+	});
+
+	// ===== shell_jobs: the model-facing view of running/backgrounded commands =====
+	pi.registerTool({
+		name: "shell_jobs",
+		label: "shell jobs",
+		description:
+			"Inspect the shell commands this session started. action=list shows them, " +
+			`action=output reads a job's output so far, action=kill stops it. Use this instead of ` +
+			`re-running a command that was moved to the background. Commands still running after ` +
+			`${AUTO_BACKGROUND_SECONDS}s are backgrounded automatically.`,
+		promptSnippet: "Inspect backgrounded shell commands: list them, read their output, kill them",
+		promptGuidelines: [
+			'A command reported as "moved to background" is still running: read it with shell_jobs action="output", never start a second copy.',
+		],
+		parameters: Type.Object({
+			action: Type.Optional(
+				Type.Union([Type.Literal("list"), Type.Literal("output"), Type.Literal("kill")], {
+					description: "What to do. Default: list.",
+				}),
+			),
+			id: Type.Optional(
+				Type.Number({ description: "Job id. Optional when exactly one job exists." }),
+			),
+		}),
+		execute: async (_toolCallId, params) => {
+			const action = params.action ?? "list";
+			const all = [...state.running.values(), ...state.background.values()].sort((a, b) => a.id - b.id);
+			if (action === "list") {
+				return toolText(
+					all.length === 0
+						? "No shell command is running or backgrounded."
+						: `Shell jobs:\n${all.map((job) => jobLine(job)).join("\n")}\n` +
+							`Read one with action="output" and its id; stop it with action="kill".`,
+				);
+			}
+			const job = params.id === undefined ? (all.length === 1 ? all[0] : undefined) : all.find((j) => j.id === params.id);
+			if (!job) {
+				return toolText(
+					params.id === undefined
+						? "Pass an id: there is not exactly one job to act on."
+						: `No shell job #${params.id}.`,
+				);
+			}
+			if (action === "kill") {
+				return toolText(
+					killJob(job.id)
+						? `Killed #${job.id}: ${clip(job.command, 160)}`
+						: `Could not kill #${job.id} - it had already finished.`,
+				);
+			}
+			return toolText(
+				[
+					`#${job.id} ${job.tool} ${jobState(job)} for ${fmtElapsed(Date.now() - job.startedAt)}`,
+					`command: ${job.command}`,
+					`cwd: ${job.cwd}`,
+					"",
+					`--- output so far (${job.output.length} chars) ---`,
+					job.output.slice(-OUTPUT_VIEW).trim() || "(no output yet)",
+					"",
+					"It is still running: do not start another copy, and do not sleep to wait.",
+				].join("\n"),
+			);
+		},
 	});
 
 	// ===== /background: inspect or kill shell jobs =====

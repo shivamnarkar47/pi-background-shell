@@ -12,7 +12,9 @@ While the model is running a shell command:
 - The process keeps running — pressing **Escape** after backgrounding does *not* kill it.
 - When the process exits, pi shows a **toast** and sends the agent a **user message** with the command, cwd, exit code, duration and the tail of its output.
 - A footer status (`bg: #2`) tracks background jobs and clears as they finish.
-- The agent is told what a backgrounded command means: **do not re-run it, do not sleep or poll to wait for it, and end the turn if there is nothing else to do** — and wait commands are refused outright while a job runs, so it cannot idle on a `sleep`.
+- **Nothing over 20s blocks a turn.** A command still running after `AUTO_BACKGROUND_SECONDS` (20) is backgrounded automatically, with no keypress.
+- The agent is told what a backgrounded command means: **do not re-run it, do not sleep or poll to wait for it, and end the turn if there is nothing else to do** — and it is given a `shell_jobs` tool to read a running command instead of guessing.
+- While a job is backgrounded, the wrapper **refuses** wait commands and **second copies** of a command that is already running.
 
 When no command is running, Ctrl+B is passed through untouched, so its default "cursor left" behaviour is preserved.
 
@@ -109,9 +111,36 @@ Both say: never re-run a backgrounded command, never wait for it (`sleep`, `Star
 
 The same text can be pinned in `~/.pi/agent/AGENTS.md` (pi's user-instructions context file) if you want the rule to hold even when the extension is not installed.
 
-## Wait commands are refused
+## Auto-background after 20s
 
-Instructions alone are not always enough, so while at least one backgrounded job is running the wrapper **refuses wait commands** before spawning them. The tool call returns an error telling the model to do other work or end its turn, and a toast tells you what happened:
+You do not have to press Ctrl+B. A command still running after `AUTO_BACKGROUND_SECONDS` (20) is detached automatically — the tool call returns, the turn continues, and the completion report arrives when the process exits:
+
+```
+[pi] Command still running after 20s, so it was moved to the background automatically (job #4). …
+```
+```
+powershell #4 still running after 20s - moved to background
+```
+
+The completion report says so too (`…, auto-backgrounded after 20s`), so the model can tell the difference between a command it backgrounded deliberately and one the timer caught. Edit the constant at the top of `background-shell.ts` to change the threshold.
+
+## The `shell_jobs` tool
+
+Blocking the re-run only helps if the agent has another way to see what a running command is doing, so the extension registers a small model-facing tool:
+
+| Call | Result |
+| --- | --- |
+| `shell_jobs` / `{action: "list"}` | Every job: `#id`, running/background (auto), elapsed, command |
+| `{action: "output", id}` | The job's output so far, its cwd, and a reminder that it is still running |
+| `{action: "kill", id}` | Kills the job |
+
+It closes the incentive that produced this failure mode: before, the only way to see a live command's output was to start it again.
+
+## What gets refused while a job is running
+
+While at least one job is backgrounded, two things are refused before anything is spawned — the tool call returns an error and you get a toast.
+
+**Wait commands.** Instructions alone demonstrably did not stop the agent idling on a `sleep`, so it is enforced:
 
 ```
 [pi] refused: Start-Sleep -Seconds 30 is a wait command, and background job(s) #27 are still
@@ -135,7 +164,15 @@ Deliberately not matched:
 - `ping -c 1 host` — a single connectivity check.
 - Anything else once a backgrounded job has finished, so ordinary `sleep` commands still work.
 
-It is a regex heuristic: a wait hidden in a script the agent wrote itself is not detected.
+**A second copy of a command that is already running.** The real incident: after backgrounding `python proto_gee.py`, the agent re-ran it wrapped in `timeout 300 … > /tmp/gee_out.txt; sed -n …` — two concurrent copies of the same script. Commands are reduced to the part that decides what runs (`cd …&&`, `timeout N`, redirections and trailing `| sed`/`Select-String` are stripped) and an exact match against a live job is refused:
+
+```
+[pi] refused: background job #69 is already running this command (PYTHONIOENCODING=utf-8 python
+proto_gee.py). Do not start a second copy. Read it with shell_jobs (action "output", id 69) or
+kill it with action "kill"; the full result is delivered automatically when it finishes.
+```
+
+Different arguments (`python proto_gee.py --dry-run`) are a different command and stay allowed. Both matchers are regex heuristics: a wait or a duplicate hidden inside a script the agent wrote itself is not detected.
 
 ## Behaviour notes
 
@@ -147,11 +184,16 @@ It is a regex heuristic: a wait hidden in a script the agent wrote itself is not
 
 ## Test
 
-`tests/smoke.mjs` loads the extension through pi's own loader and checks a normal run, Ctrl+B backgrounding and the completion report. It needs an installed pi:
+Both need an installed pi:
 
 ```sh
-PI_PACKAGE_DIR=/path/to/node_modules/@earendil-works/pi-coding-agent node tests/smoke.mjs
+PI_PACKAGE_DIR=/path/to/node_modules/@earendil-works/pi-coding-agent node tests/smoke.mjs            # ~25s
+PI_PACKAGE_DIR=/path/to/node_modules/@earendil-works/pi-coding-agent node tests/auto-background.mjs   # ~30s
 ```
+
+`tests/smoke.mjs` loads the extension through pi's own loader and covers a normal run, shell resolution against pi's built-ins, Ctrl+B, the wait and duplicate refusals, `/background`, `shell_jobs` and the completion reports.
+
+`tests/auto-background.mjs` is separate on purpose: it has to outlast the 20-second threshold, so it runs once and checks that the timer detaches a command with no keypress, that the note and toast say it was automatic, and that the report says `auto-backgrounded after 20s`.
 
 `PI_PACKAGE_DIR` may point at the package root or its `dist` folder; it can be omitted when `@earendil-works/pi-coding-agent` is resolvable from the repo.
 
