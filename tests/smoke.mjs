@@ -111,6 +111,29 @@ check("Ctrl+B passes through when idle", inputHandler("\x02") === undefined);
 const quick = await run("quick", "Write-Output hi");
 check("normal run returns output", JSON.stringify(quick).includes("hi"), JSON.stringify(quick));
 
+// 2b. timeout and sleep are refused even with nothing backgrounded.
+const bareTimeout = await run("timeout-ok", "timeout 30 Write-Output deadline-style");
+check(
+	"timeout is refused with nothing backgrounded",
+	typeof bareTimeout?.error === "string" &&
+		bareTimeout.error.includes("refused") &&
+		bareTimeout.error.includes("timeout"),
+	JSON.stringify(bareTimeout),
+);
+const bareSleep = await run("sleep-ok", "Start-Sleep -Seconds 2; Write-Output after-sleep");
+check(
+	"sleep is refused with nothing backgrounded",
+	typeof bareSleep?.error === "string" &&
+		bareSleep.error.includes("refused") &&
+		bareSleep.error.includes("sleep or wait"),
+	JSON.stringify(bareSleep),
+);
+check(
+	"refusals are toasted",
+	notices.some((n) => n.includes("Refused a timeout")) && notices.some((n) => n.includes("Refused a sleep")),
+	notices.join(" | "),
+);
+
 // 3. The overridden tools must resolve the same shell as pi's built-in tools.
 //    Backgrounded runs go through the same wrapper, so this is what keeps a
 //    backgrounded command on the default shell.
@@ -153,8 +176,13 @@ if (failed(bashForeground) || failed(bashBuiltin)) {
 }
 
 // 4. Ctrl+B detaches a running command.
+//    A busy loop, not Start-Sleep: sleep commands are refused outright.
 const started = Date.now();
-const long = run("long", `Start-Sleep -Seconds 6; Write-Output late-result; ${PS_PROBE}`);
+const long = run(
+	"long",
+	`Write-Output late-result; ${PS_PROBE}; $t = [Diagnostics.Stopwatch]::StartNew(); ` +
+		`while ($t.Elapsed.TotalSeconds -lt 6) {}; Write-Output late-done`,
+);
 await sleep(500);
 check("Ctrl+B consumed while running", JSON.stringify(inputHandler("\x02")) === '{"consume":true}');
 const detached = await long;
@@ -185,12 +213,6 @@ check(
 	"other work still allowed while backgrounded",
 	JSON.stringify(otherWork).includes("other-work"),
 	JSON.stringify(otherWork),
-);
-const bareTimeout = await run("timeout-ok", "timeout 30 Write-Output deadline-style");
-check(
-	"command deadline (timeout N) is not treated as a wait",
-	!JSON.stringify(bareTimeout).includes("refused"),
-	JSON.stringify(bareTimeout),
 );
 
 // 6. /background lists jobs and kills them.
@@ -265,7 +287,7 @@ check("shell_jobs list shows it as background", listed.includes(`#${liveId}`) &&
 
 const duplicate = await run(
 	"duplicate",
-	`cd ${process.cwd()} && timeout 300 ${VICTIM_BODY} > $null 2>&1; Select-String -Pattern victim-done`,
+	`cd ${process.cwd()} && ${VICTIM_BODY} > $null 2>&1; Select-String -Pattern victim-done`,
 );
 check(
 	"duplicate of a backgrounded command refused",

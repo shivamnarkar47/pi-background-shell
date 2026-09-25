@@ -14,7 +14,8 @@ While the model is running a shell command:
 - A footer status (`bg: #2`) tracks background jobs and clears as they finish.
 - **Nothing over 20s blocks a turn.** A command still running after `AUTO_BACKGROUND_SECONDS` (20) is backgrounded automatically, with no keypress.
 - The agent is told what a backgrounded command means: **do not re-run it, do not sleep or poll to wait for it, and end the turn if there is nothing else to do** — and it is given a `shell_jobs` tool to read a running command instead of guessing.
-- While a job is backgrounded, the wrapper **refuses** wait commands and **second copies** of a command that is already running.
+- While a job is backgrounded, the wrapper also refuses **second copies** of a command that is already running.
+- `timeout` and sleep commands are **refused outright, always** — the tool has its own `timeout` parameter, and a shell `timeout` reports 124 instead of the real exit code.
 
 When no command is running, Ctrl+B is passed through untouched, so its default "cursor left" behaviour is preserved.
 
@@ -136,35 +137,39 @@ Blocking the re-run only helps if the agent has another way to see what a runnin
 
 It closes the incentive that produced this failure mode: before, the only way to see a live command's output was to start it again.
 
-## What gets refused while a job is running
+## What gets refused
 
-While at least one job is backgrounded, two things are refused before anything is spawned — the tool call returns an error and you get a toast.
+Two rules are enforced in the wrapper, before anything is spawned: the tool call returns an error and you get a toast.
 
-**Wait commands.** Instructions alone demonstrably did not stop the agent idling on a `sleep`, so it is enforced:
+### `timeout` and sleep — always, not just while something is pending
+
+`timeout 400 uv run pytest …` is refused even with no background job at all:
 
 ```
-[pi] refused: Start-Sleep -Seconds 30 is a wait command, and background job(s) #27 are still
-running. Do not sleep or poll to wait for them. Do other work, or end your turn - pi will
-message you with the exit code and output when the job finishes.
+[pi] refused: timeout 400 uv run pytest … wraps a command in `timeout`. Pass the tool's own timeout
+parameter instead - a shell `timeout` reports exit code 124 and hides the real failure. If you are
+waiting for something, do other work or end your turn.
 ```
 
-Matched idioms:
+That is the point of banning it: the tool already has a `timeout` parameter, and a shell-level `timeout` reports 124 instead of the real exit code, so a failing test ends up looking like a slow one.
 
-| Idiom | Example |
+Sleep and wait constructs get the same treatment and the same advice:
+
+| Refused | Example |
 | --- | --- |
+| `timeout` / `gtimeout` | `timeout 400 …`, `timeout /t 30` |
 | `sleep` / `tsleep` | `sleep 280` |
 | PowerShell wait cmdlets | `Start-Sleep 30`, `Wait-Sleep`, `Wait-Event` |
-| Windows sleep | `timeout /t 30` |
 | ping-as-sleep | `ping -n 11 127.0.0.1` |
-| interpreter sleeps | `time.sleep(60)`, `setTimeout(done, 60000)` |
+| one-liner interpreter sleeps | `time.sleep(60)`, `setTimeout(done, 60000)` |
 
-Deliberately not matched:
+Still allowed: `ping -c 1 host` (a single connectivity check), and anything else — a command that genuinely needs a pause should express the *work*, not the waiting.
 
-- `timeout 500 uv run pytest` — a deadline, not a wait.
-- `ping -c 1 host` — a single connectivity check.
-- Anything else once a backgrounded job has finished, so ordinary `sleep` commands still work.
+Need one anyway? Set `PI_ALLOW_WAIT_COMMANDS=1` before starting pi and both rules stand down (the model-facing instructions still apply).
 
-**A second copy of a command that is already running.** The real incident: after backgrounding `python proto_gee.py`, the agent re-ran it wrapped in `timeout 300 … > /tmp/gee_out.txt; sed -n …` — two concurrent copies of the same script. Commands are reduced to the part that decides what runs (`cd …&&`, `timeout N`, redirections and trailing `| sed`/`Select-String` are stripped) and an exact match against a live job is refused:
+### A second copy of a command that is already running
+
+The incident that prompted this: after backgrounding `python proto_gee.py`, the agent re-ran it as `timeout 300 … > /tmp/gee_out.txt; sed -n …` — two concurrent copies of the same script. Commands are reduced to the part that decides what runs (`cd …&&`, `timeout N`, redirections and a trailing `| sed`/`Select-String` are stripped) and an exact match against a live job is refused:
 
 ```
 [pi] refused: background job #69 is already running this command (PYTHONIOENCODING=utf-8 python
