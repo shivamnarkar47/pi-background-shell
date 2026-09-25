@@ -12,7 +12,7 @@ While the model is running a shell command:
 - The process keeps running — pressing **Escape** after backgrounding does *not* kill it.
 - When the process exits, pi shows a **toast** and sends the agent a **user message** with the command, cwd, exit code, duration and the tail of its output.
 - A footer status (`bg: #2`) tracks background jobs and clears as they finish.
-- The agent is told what a backgrounded command means: **do not re-run it, do not sleep or poll to wait for it, and end the turn if there is nothing else to do.**
+- The agent is told what a backgrounded command means: **do not re-run it, do not sleep or poll to wait for it, and end the turn if there is nothing else to do** — and wait commands are refused outright while a job runs, so it cannot idle on a `sleep`.
 
 When no command is running, Ctrl+B is passed through untouched, so its default "cursor left" behaviour is preserved.
 
@@ -78,6 +78,34 @@ Backgrounding only helps if the agent stops waiting on the command, so the rule 
 Both say: never re-run a backgrounded command, never wait for it (`sleep`, `Start-Sleep`, `Wait-Sleep`, `timeout`, poll loops), do other work if there is any, and otherwise end the turn — the result arrives on its own.
 
 The same text can be pinned in `~/.pi/agent/AGENTS.md` (pi's user-instructions context file) if you want the rule to hold even when the extension is not installed.
+
+## Wait commands are refused
+
+Instructions alone are not always enough, so while at least one backgrounded job is running the wrapper **refuses wait commands** before spawning them. The tool call returns an error telling the model to do other work or end its turn, and a toast tells you what happened:
+
+```
+[pi] refused: Start-Sleep -Seconds 30 is a wait command, and background job(s) #27 are still
+running. Do not sleep or poll to wait for them. Do other work, or end your turn - pi will
+message you with the exit code and output when the job finishes.
+```
+
+Matched idioms:
+
+| Idiom | Example |
+| --- | --- |
+| `sleep` / `tsleep` | `sleep 280` |
+| PowerShell wait cmdlets | `Start-Sleep 30`, `Wait-Sleep`, `Wait-Event` |
+| Windows sleep | `timeout /t 30` |
+| ping-as-sleep | `ping -n 11 127.0.0.1` |
+| interpreter sleeps | `time.sleep(60)`, `setTimeout(done, 60000)` |
+
+Deliberately not matched:
+
+- `timeout 500 uv run pytest` — a deadline, not a wait.
+- `ping -c 1 host` — a single connectivity check.
+- Anything else once a backgrounded job has finished, so ordinary `sleep` commands still work.
+
+It is a regex heuristic: a wait hidden in a script the agent wrote itself is not detected.
 
 ## Behaviour notes
 

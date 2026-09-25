@@ -111,7 +111,7 @@ check("normal run returns output", JSON.stringify(quick).includes("hi"), JSON.st
 
 // 3. Ctrl+B detaches a running command.
 const started = Date.now();
-const long = run("long", "Start-Sleep -Seconds 2; Write-Output late-result");
+const long = run("long", "Start-Sleep -Seconds 6; Write-Output late-result");
 await sleep(500);
 check("Ctrl+B consumed while running", JSON.stringify(inputHandler("\x02")) === '{"consume":true}');
 const detached = await long;
@@ -124,8 +124,34 @@ check(
 );
 check("note tells the model to end its turn", detachedText.includes("end your turn"), detachedText);
 
-// 4. Completion report reaches the user and the agent.
-await sleep(2500);
+// 4. While a job is backgrounded: wait commands are refused, other work is not.
+const refused = await run("wait-attempt", "Start-Sleep -Seconds 30");
+check(
+	"wait command refused while backgrounded",
+	typeof refused?.error === "string" && refused.error.includes("refused") && refused.error.includes("wait command"),
+	JSON.stringify(refused),
+);
+const refusedPing = await run("ping-attempt", "ping -n 4 127.0.0.1 > $null");
+check(
+	"ping-as-sleep refused while backgrounded",
+	typeof refusedPing?.error === "string" && refusedPing.error.includes("refused"),
+	JSON.stringify(refusedPing),
+);
+const otherWork = await run("other-work", "Write-Output other-work");
+check(
+	"other work still allowed while backgrounded",
+	JSON.stringify(otherWork).includes("other-work"),
+	JSON.stringify(otherWork),
+);
+const bareTimeout = await run("timeout-ok", "timeout 30 Write-Output deadline-style");
+check(
+	"command deadline (timeout N) is not treated as a wait",
+	!JSON.stringify(bareTimeout).includes("refused"),
+	JSON.stringify(bareTimeout),
+);
+
+// 5. Completion report reaches the user and the agent.
+await sleep(6500);
 check(
 	"toast shown on completion",
 	notices.some((notice) => notice.includes("finished in")),

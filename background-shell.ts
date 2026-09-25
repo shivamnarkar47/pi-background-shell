@@ -110,9 +110,27 @@ A shell tool result containing "Command moved to background" means the process i
 Pi delivers its exit code and output as a message when it exits.
 
 - Never re-run a backgrounded command, and never wait for it: no \`sleep\`, \`Start-Sleep\`,
-  \`Wait-Sleep\`, \`timeout\`, or any poll/re-check loop.
+  \`Wait-Sleep\`, \`timeout\`, or any poll/re-check loop. Pi refuses such commands outright
+  while a backgrounded command is still running.
 - If you have other work, do it. If you have nothing else to do, end your turn immediately -
   the result arrives on its own.`;
+
+/**
+ * Wait idioms the model reaches for instead of ending its turn. Best effort: a wait
+ * hidden in a script it wrote itself is not detected.
+ */
+const WAIT_IDIOMS: readonly RegExp[] = [
+	/(^|[\s;&|(])(?:sleep|tsleep)\s+\d/i, // sleep 280
+	/\b(?:start-sleep|wait-sleep|wait-event)\b/i, // Start-Sleep 30
+	/\btimeout\s+\/t\b/i, // timeout /t 30
+	/\bping\s+-[nc]\s*(?:[2-9]|\d{2,})\b/i, // ping -n 11 127.0.0.1
+	/\btime\.sleep\s*\(/i, // python -c "import time; time.sleep(60)"
+	/\bsettimeout\s*\(/i, // node -e "setTimeout(done, 60000)"
+];
+
+function isWaitCommand(command: string): boolean {
+	return WAIT_IDIOMS.some((pattern) => pattern.test(command));
+}
 
 /* ------------------------------------------------------- operations wrapper */
 
@@ -126,6 +144,15 @@ Pi delivers its exit code and output as a message when it exits.
 function wrapOperations(tool: string, base: BashOperations): BashOperations {
 	return {
 		exec: (command, cwd, options) => {
+			if (state.background.size > 0 && isWaitCommand(command)) {
+				const ids = [...state.background.keys()].map((id) => `#${id}`).join(", ");
+				notify(`Refused a wait command while ${ids} runs in the background`);
+				throw new Error(
+					`[pi] refused: ${command.slice(0, 200)} is a wait command, and background job(s) ${ids} ` +
+						`are still running. Do not sleep or poll to wait for them. Do other work, or end ` +
+						`your turn - pi will message you with the exit code and output when the job finishes.`,
+				);
+			}
 			const job: Job = {
 				id: state.nextId++,
 				tool,
