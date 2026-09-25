@@ -67,6 +67,23 @@ pi's extension API can register tools and raw terminal input listeners, which is
 
 Job state lives in a `globalThis` registry, so `/reload` (which re-imports the extension) does not orphan a command that was backgrounded before the reload.
 
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `/background` | Renders a card listing every running (`run`) and backgrounded (`bg`) shell command: id, elapsed time, command, and the last line of output. |
+| `/background kill <id>` | Kills that job (running or backgrounded) and reports the cancellation to you and the agent. |
+| `/background kill all` | Kills every backgrounded job. |
+
+```
+⏱ Background shell  2 commands
+bg   #3      2m14s   npm run build                     … compiled in 41.2s
+run  #5        1.2s  uv run pytest tests -x
+kill one: /background kill <id>  ·  all: /background kill all
+```
+
+The card is appended to the stream, not to the model's context. Killing a job aborts the same controller that owns its child process, so the process tree is torn down and the normal completion report fires with `cancelled by the user` — the agent is told the command was cancelled rather than left waiting.
+
 ## Shell resolution
 
 The wrapper never picks a shell. It delegates to pi's own `createLocalBashOperations({ shellPath })` and `createLocalPowerShellOperations()`, built from the same settings the built-in tools use (`SettingsManager.getShellPath()`, `getShellCommandPrefix()`), and pi re-resolves the shell on **every** exec:

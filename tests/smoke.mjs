@@ -59,6 +59,7 @@ check(
 const notices = [];
 const statuses = [];
 const messages = [];
+const entries = [];
 let inputHandler;
 const ctx = {
 	ui: {
@@ -71,6 +72,7 @@ const ctx = {
 	},
 };
 load.runtime.sendUserMessage = (message, options) => messages.push({ message, options });
+load.runtime.appendEntry = (type, data) => entries.push({ type, data });
 
 await ext.handlers.get("session_start")?.[0]?.({ type: "session_start", reason: "startup" }, ctx);
 check("terminal input hook installed", typeof inputHandler === "function");
@@ -191,7 +193,51 @@ check(
 	JSON.stringify(bareTimeout),
 );
 
-// 5. Completion report reaches the user and the agent.
+// 6. /background lists jobs and kills them.
+//    The victim must not look like a wait command, or the guard refuses it first.
+const backgroundCommand = ext.commands.get("background");
+check("/background command registered", Boolean(backgroundCommand?.handler));
+
+const victim = run(
+	"victim",
+	"$t = [Diagnostics.Stopwatch]::StartNew(); while ($t.Elapsed.TotalSeconds -lt 20) {}; Write-Output never-printed",
+);
+await sleep(700);
+check("second Ctrl+B detaches the new job", JSON.stringify(inputHandler("\x02")) === '{"consume":true}');
+check("victim tool call was released, not refused", !JSON.stringify(await victim).includes("refused"));
+await victim;
+
+await backgroundCommand.handler("", ctx);
+const card = entries.at(-1);
+const rows = card?.data?.rows ?? [];
+check("/background card lists the jobs", card?.type === "background-shell-jobs" && rows.length >= 1, JSON.stringify(card));
+const victimRow = rows.find((row) => row.command.includes("never-printed"));
+check(
+	"card shows the backgrounded job with its command",
+	Boolean(victimRow) && victimRow.detached === true,
+	JSON.stringify(rows),
+);
+
+if (victimRow) {
+	await backgroundCommand.handler(`kill ${victimRow.id}`, ctx);
+	check("kill confirms with a toast", notices.some((n) => n.includes(`Killed #${victimRow.id}`)), notices.join(" | "));
+} else {
+	check("kill step skipped: no victim row", false, "the victim job never appeared in the card");
+}
+check(
+	"killing an unknown id is reported, not thrown",
+	(await backgroundCommand.handler("kill 9999", ctx)) === undefined &&
+		notices.some((n) => n.includes("No running or backgrounded job: #9999")),
+	notices.join(" | "),
+);
+check(
+	"a non-numeric id is reported, not thrown",
+	(await backgroundCommand.handler("kill abc", ctx)) === undefined &&
+		notices.some((n) => n.includes("No such job: abc")),
+	notices.join(" | "),
+);
+
+// 7. Completion report reaches the user and the agent.
 await sleep(6500);
 check(
 	"toast shown on completion",
@@ -210,6 +256,12 @@ check(
 		output(psForeground).length > 0 &&
 		backgroundReport.includes(output(psForeground)),
 	`foreground=${output(psForeground)} report=${JSON.stringify(backgroundReport.slice(-200))}`,
+);
+check(
+	"killed job reports as cancelled by the user",
+	messages.some((m) => m.message.includes("cancelled by the user")) &&
+		notices.some((n) => n.includes("Cancelled background")),
+	JSON.stringify(messages.map((m) => m.message.split("\n")[0])),
 );
 check(
 	"footer shows the job, then clears",
