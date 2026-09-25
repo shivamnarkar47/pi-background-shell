@@ -67,6 +67,19 @@ pi's extension API can register tools and raw terminal input listeners, which is
 
 Job state lives in a `globalThis` registry, so `/reload` (which re-imports the extension) does not orphan a command that was backgrounded before the reload.
 
+## Shell resolution
+
+The wrapper never picks a shell. It delegates to pi's own `createLocalBashOperations({ shellPath })` and `createLocalPowerShellOperations()`, built from the same settings the built-in tools use (`SettingsManager.getShellPath()`, `getShellCommandPrefix()`), and pi re-resolves the shell on **every** exec:
+
+| Tool | Resolution |
+| --- | --- |
+| `bash` | `shellPath` setting → Git Bash in known locations → `bash` on PATH → `sh` |
+| `powershell` | `pwsh.exe` on PATH → `powershell.exe` (Windows only) |
+
+Detaching changes exactly two things — when the tool call returns, and whether the turn's abort signal still reaches the child. The process, its shell, cwd and environment are untouched, so a backgrounded run is indistinguishable from a foreground one. The smoke test asserts this: our `bash`/`powershell` tools resolve the same shell as pi's built-in definitions, and a backgrounded job's completion report contains the same shell identity as a foreground run.
+
+> On Windows without Git for Windows, `bash` resolves to the WSL launcher (`C:\Windows\System32\bash.exe`), so `bash` commands run under WSL — that is pi's default, and the backgrounded job stays in WSL too.
+
 ## The rule the agent is given
 
 Backgrounding only helps if the agent stops waiting on the command, so the rule is stated twice:

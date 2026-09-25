@@ -295,8 +295,11 @@ export default function (pi: ExtensionAPI) {
 		/* fall back to pi's defaults */
 	}
 
-	// Override the built-in shell tools: same schema, prompt and renderers,
-	// but execution goes through the wrapper that can be detached with Ctrl+B.
+	// Override the built-in shell tools: same schema, prompt and renderers, and the
+	// same shell resolution (pi re-resolves getShellConfig / getPowerShellConfig on
+	// every exec, and shellPath/commandPrefix come from the same settings the
+	// built-ins use), so a backgrounded run is indistinguishable from a foreground
+	// one apart from when its tool call returns.
 	pi.registerTool(
 		createBashToolDefinition(cwd, {
 			commandPrefix,

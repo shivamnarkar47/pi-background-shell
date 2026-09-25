@@ -109,9 +109,50 @@ check("Ctrl+B passes through when idle", inputHandler("\x02") === undefined);
 const quick = await run("quick", "Write-Output hi");
 check("normal run returns output", JSON.stringify(quick).includes("hi"), JSON.stringify(quick));
 
-// 3. Ctrl+B detaches a running command.
+// 3. The overridden tools must resolve the same shell as pi's built-in tools.
+//    Backgrounded runs go through the same wrapper, so this is what keeps a
+//    backgrounded command on the default shell.
+const settings = pi.SettingsManager.create(process.cwd(), pi.getAgentDir());
+const builtins = {
+	bash: pi.createBashToolDefinition(process.cwd(), {
+		commandPrefix: settings.getShellCommandPrefix(),
+		shellPath: settings.getShellPath(),
+	}),
+	powershell: pi.createPowerShellToolDefinition(process.cwd()),
+};
+const execTool = (definition, id, command) =>
+	definition
+		.execute(id, { command }, new AbortController().signal, undefined, toolCtx)
+		.catch((error) => ({ error: error.message }));
+const output = (result) => (result?.content?.[0]?.text ?? "").trim();
+const failed = (result) => typeof result?.error === "string";
+
+const PS_PROBE = 'Write-Output "$($PSVersionTable.PSEdition):$([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)"';
+const BASH_PROBE = 'printf %s "|$BASH_VERSION|$(uname -sr)"';
+
+const psForeground = await run("probe-ps", PS_PROBE);
+const psBuiltin = await execTool(builtins.powershell, "probe-ps-builtin", PS_PROBE);
+check(
+	"powershell tool uses the same shell as pi's built-in",
+	!failed(psForeground) && !failed(psBuiltin) && output(psForeground) === output(psBuiltin),
+	`${output(psForeground)} vs ${output(psBuiltin)} ${JSON.stringify(psBuiltin)}`,
+);
+
+const bashForeground = await execTool(ext.tools.get("bash").definition, "probe-bash", BASH_PROBE);
+const bashBuiltin = await execTool(builtins.bash, "probe-bash-builtin", BASH_PROBE);
+if (failed(bashForeground) || failed(bashBuiltin)) {
+	console.log(`SKIP  no bash shell here (${JSON.stringify(bashForeground).slice(0, 120)})`);
+} else {
+	check(
+		"bash tool uses the same shell as pi's built-in",
+		output(bashForeground) === output(bashBuiltin),
+		`${output(bashForeground)} vs ${output(bashBuiltin)}`,
+	);
+}
+
+// 4. Ctrl+B detaches a running command.
 const started = Date.now();
-const long = run("long", "Start-Sleep -Seconds 6; Write-Output late-result");
+const long = run("long", `Start-Sleep -Seconds 6; Write-Output late-result; ${PS_PROBE}`);
 await sleep(500);
 check("Ctrl+B consumed while running", JSON.stringify(inputHandler("\x02")) === '{"consume":true}');
 const detached = await long;
@@ -124,7 +165,7 @@ check(
 );
 check("note tells the model to end its turn", detachedText.includes("end your turn"), detachedText);
 
-// 4. While a job is backgrounded: wait commands are refused, other work is not.
+// 5. While a job is backgrounded: wait commands are refused, other work is not.
 const refused = await run("wait-attempt", "Start-Sleep -Seconds 30");
 check(
 	"wait command refused while backgrounded",
@@ -161,6 +202,14 @@ check(
 	"agent messaged with details",
 	messages.some((m) => m.message.includes("late-result") && m.options?.deliverAs === "steer"),
 	JSON.stringify(messages),
+);
+const backgroundReport = messages.find((m) => m.message.includes("late-result"))?.message ?? "";
+check(
+	"backgrounded job ran under the same shell as a foreground run",
+	!failed(psForeground) &&
+		output(psForeground).length > 0 &&
+		backgroundReport.includes(output(psForeground)),
+	`foreground=${output(psForeground)} report=${JSON.stringify(backgroundReport.slice(-200))}`,
 );
 check(
 	"footer shows the job, then clears",
